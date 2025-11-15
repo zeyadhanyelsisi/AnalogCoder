@@ -8,6 +8,10 @@ import time
 import pandas as pd
 import sys
 import shutil
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 import signal
 import json
@@ -103,6 +107,16 @@ if "gpt" in args.model:
     client = OpenAI(api_key=args.api_key)
 elif "deepseek-chat" in args.model:
     client = OpenAI(api_key=args.api_key, base_url="https://api.deepseek.com/v1")
+elif "gemini" in args.model:
+    if genai is None:
+        raise ImportError("Please install google-generativeai: pip install google-generativeai")
+    genai.configure(api_key=args.api_key)
+    # Map old model names to new ones
+    model_name = args.model
+    if model_name == "gemini-pro":
+        model_name = "gemini-2.5-flash"
+        print(f"Note: gemini-pro is deprecated, using {model_name} instead")
+    client = genai.GenerativeModel(model_name)
 else:
     client = None
 
@@ -805,6 +819,49 @@ def work(task, input, output, task_id, it, background, task_type, flog,
                 result = subprocess.run(['ollama', 'restart'], capture_output=True, text=True)
                 start_tmux_session("ollama", "ollama serve")
                 time.sleep(120)
+        elif "gemini" in args.model:
+            try:
+                # Convert messages format for Gemini
+                gemini_messages = []
+                for msg in messages:
+                    if msg['role'] == 'system':
+                        # Gemini doesn't have system role, prepend to first user message
+                        continue
+                    elif msg['role'] == 'user':
+                        gemini_messages.append({'role': 'user', 'parts': [msg['content']]})
+                    elif msg['role'] == 'assistant':
+                        gemini_messages.append({'role': 'model', 'parts': [msg['content']]})
+                
+                # Add system message to first user message if exists
+                if messages[0]['role'] == 'system' and len(gemini_messages) > 0:
+                    gemini_messages[0]['parts'][0] = messages[0]['content'] + "\n\n" + gemini_messages[0]['parts'][0]
+                
+                response = client.generate_content(
+                    gemini_messages[-1]['parts'][0] if len(gemini_messages) == 1 else gemini_messages,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=args.temperature,
+                    )
+                )
+                # Create completion-like object for compatibility
+                class GeminiCompletion:
+                    def __init__(self, response):
+                        self.text = response.text
+                        self.usage = type('obj', (object,), {
+                            'total_tokens': 0,
+                            'prompt_tokens': 0,
+                            'completion_tokens': 0
+                        })()
+                        self.choices = [type('obj', (object,), {
+                            'message': type('obj', (object,), {'content': response.text})()
+                        })()]
+                
+                completion = GeminiCompletion(response)
+                break
+            except Exception as e:
+                print("Encountered a Gemini API error. Details:")
+                print(e)
+                print("sleep 30 seconds")
+                time.sleep(30)
         else:
             try:
                 completion = client.chat.completions.create(
@@ -832,7 +889,7 @@ def work(task, input, output, task_id, it, background, task_type, flog,
     elif "gpt-4" in args.model:
         money_quota -= (completion.usage.prompt_tokens / 1e6 * 10) + (completion.usage.completion_tokens / 1e6 * 30)
 
-    if "gpt" in args.model or "deepseek-chat" in args.model:
+    if "gpt" in args.model or "deepseek-chat" in args.model or "gemini" in args.model:
         answer = completion.choices[0].message.content
     else:
         answer = completion['message']['content']
@@ -1103,6 +1160,7 @@ def work(task, input, output, task_id, it, background, task_type, flog,
         # Ignore the compatible error
         execution_error_info = execution_error_info.replace("Unsupported Ngspice version 38", "")
         execution_error_info = execution_error_info.replace("Unsupported Ngspice version 36", "")
+        execution_error_info = execution_error_info.replace("Unsupported Ngspice version 42", "")
 
         if dc_sweep_error == 1:
             new_prompt = "According to dc sweep analysis, changing the input voltage does not change the output voltage. Please check the netlist and rewrite the complete code.\n"
@@ -1266,19 +1324,28 @@ def get_retrieval(task, task_id):
             {"role": "system", "content": "You are an analog integrated circuits expert."},
             {"role": "user", "content": prompt}
         ]
-    if "gpt" in args.model and args.retrieval:
+    if ("gpt" in args.model or "gemini" in args.model) and args.retrieval:
         try:
-            completion = client.chat.completions.create(
-                model = args.model,
-                messages = messages,
-                temperature = args.temperature
-            )
-        except openai.APIStatusError as e:
-            print("Encountered an APIStatusError. Details:")
+            if "gemini" in args.model:
+                response = client.generate_content(
+                    messages[0]['content'] + "\n\n" + messages[1]['content'],
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=args.temperature,
+                    )
+                )
+                answer = response.text
+            else:
+                completion = client.chat.completions.create(
+                    model = args.model,
+                    messages = messages,
+                    temperature = args.temperature
+                )
+                answer = completion.choices[0].message.content
+        except Exception as e:
+            print("Encountered an API error. Details:")
             print(e)
             print("sleep 30 seconds")
             time.sleep(30)
-        answer = completion.choices[0].message.content
         print("answer", answer)
         fretre_path = os.path.join(args.model.replace("-", ""), f"p{str(task_id)}", "retrieve.txt")
         fretre = open(fretre_path, "w")
